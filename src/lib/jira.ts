@@ -1305,6 +1305,13 @@ export class JiraClient {
     });
   }
 
+  // Get a single sprint by ID (to get up-to-date state)
+  async getSprint(sprintId: number): Promise<{ id: number; state: string; name: string; startDate?: string; endDate?: string }> {
+    return this.fetch<{ id: number; state: string; name: string; startDate?: string; endDate?: string }>(
+      `/rest/agile/1.0/sprint/${sprintId}`
+    );
+  }
+
   // Delete a sprint
   async deleteSprint(sprintId: number): Promise<void> {
     await this.fetch(`/rest/agile/1.0/sprint/${sprintId}`, {

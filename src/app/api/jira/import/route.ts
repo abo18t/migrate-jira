@@ -13,7 +13,7 @@ interface ImportIssue {
     summary: string;
     description?: string;
     issuetype: { name: string };
-    status?: { 
+    status?: {
       name: string;
       statusCategory?: { key: string; name: string };
     };
@@ -87,7 +87,7 @@ const DEFAULT_ISSUE_TYPE_MAPPING: Record<string, string> = {
 
 export async function POST(request: Request) {
   console.log("=== IMPORT API CALLED ===");
-  
+
   let requestBody;
   try {
     console.log("Step 1: Parsing request body...");
@@ -101,12 +101,12 @@ export async function POST(request: Request) {
     });
   }
 
-  const { 
-    domain, 
-    email, 
-    apiToken, 
-    projectMapping, 
-    importData, 
+  const {
+    domain,
+    email,
+    apiToken,
+    projectMapping,
+    importData,
     autoCreateProjects,
     fieldMapping,
     issueTypeMapping,
@@ -126,9 +126,9 @@ export async function POST(request: Request) {
   };
 
   // For reimport mode: old key -> new key mapping from previous audit log
-  // Detect and discard identity mappings (all keys map to themselves = no real mapping)
+  // Detect and discard identity mappings ONLY when NOT in sprintsOnly mode // (identity mappings are valid when source and target use the same project key)
   let existingKeyMapping: Record<string, string> = existingKeyMappingInput || {};
-  if (Object.keys(existingKeyMapping).length > 0) {
+  if (Object.keys(existingKeyMapping).length > 0 && !reimportOptionsInput?.updateSprintsOnly) {
     const hasRealMapping = Object.entries(existingKeyMapping).some(([k, v]) => k !== v);
     if (!hasRealMapping) {
       console.log("[reimport] Detected identity key mapping (all keys map to themselves) - discarding, will use summary matching instead");
@@ -173,7 +173,7 @@ export async function POST(request: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       console.log("Step 5: Stream started");
-      
+
       const send = (data: Record<string, unknown>) => {
         if (controllerClosed) return;
         try {
@@ -185,7 +185,7 @@ export async function POST(request: Request) {
           controllerClosed = true;
         }
       };
-      
+
       const closeController = () => {
         if (!controllerClosed) {
           controllerClosed = true;
@@ -195,12 +195,12 @@ export async function POST(request: Request) {
 
       try {
         const client = new JiraClient({ domain, email, apiToken });
-        
+
         // Get target workspace custom fields by name
         send({ type: "status", message: "Fetching target workspace fields..." });
         const targetFields = await client.getCustomFieldsByName();
         console.log("[import] Target custom fields:", Object.keys(targetFields).slice(0, 10));
-        
+
         // Map fields by name (case-insensitive)
         const fieldIds = {
           storyPoints: targetFields['story points'] || targetFields['story point estimate'] || fieldMapping?.storyPoints || 'customfield_10016',
@@ -245,7 +245,7 @@ export async function POST(request: Request) {
           if (exactMatch) {
             return exactMatch;
           }
-          
+
           // Check explicit mapping
           const lower = originalType.toLowerCase();
           if (issueTypes[lower]) {
@@ -255,16 +255,16 @@ export async function POST(request: Request) {
               return exactMapped;
             }
           }
-          
+
           // Fallback: try common types in order of preference
           for (const fallback of ['Task', 'Story', 'Bug']) {
             const exact = resolveTargetType(fallback);
             if (exact) return exact;
           }
-          
+
           return 'Task';
         };
-        
+
         const results: {
           success: { oldKey: string; newKey: string; project: string; action: 'created' | 'updated'; matchMethod?: string }[];
           failed: { oldKey: string; error: string }[];
@@ -309,7 +309,7 @@ export async function POST(request: Request) {
             const sourceProjectKey = board.project?.projectKey;
             const sourceProjectName = board.project?.projectName;
             const targetProjectKey = sourceProjectKey ? projectMapping[sourceProjectKey] : null;
-            
+
             if (targetProjectKey && sourceProjectKey === targetProjectKey) {
               const exists = await client.projectExists(targetProjectKey);
               if (!exists) {
@@ -336,7 +336,7 @@ export async function POST(request: Request) {
           const board = boards[pi];
           const sourceProjectKey = board.project?.projectKey;
           const targetProjectKey = sourceProjectKey ? projectMapping[sourceProjectKey] : null;
-          
+
           send({
             type: "progress",
             message: `Processing project ${targetProjectKey || sourceProjectKey}`,
@@ -393,42 +393,42 @@ export async function POST(request: Request) {
           const issuesToCreate: ImportIssue[] = [];
           const existingIssueKeys = new Set<string>();
 
-          
+
           if (reimportMode) {
             // If no audit log provided, scan target and match by summary
             if (Object.keys(existingKeyMapping).length === 0) {
               send({ type: "status", message: `Scanning ${targetProjectKey} issues for matching...`, phase: "scanning" });
               try {
                 const targetIssues = await client.getProjectIssuesForMatching(targetProjectKey);
-                
+
                 // Build summary -> list of target issues (handle duplicates)
                 const summaryToTargets: Record<string, Array<{ key: string; typeCategory: 'epic' | 'standard' | 'subtask' }>> = {};
                 for (const ti of targetIssues) {
                   if (!summaryToTargets[ti.summary]) summaryToTargets[ti.summary] = [];
                   summaryToTargets[ti.summary].push({ key: ti.key, typeCategory: ti.typeCategory });
                 }
-                
+
                 // Track which target keys have been claimed
                 const claimedTargetKeys = new Set<string>();
                 const matchCount = { found: 0, notFound: 0, typeSkipped: 0 };
-                
+
                 // Sort source issues by key number for deterministic matching
                 const sortedSourceIssues = [...board.issues].sort((a, b) => {
                   const aNum = parseInt(a.key.split('-')[1]) || 0;
                   const bNum = parseInt(b.key.split('-')[1]) || 0;
                   return aNum - bNum;
                 });
-                
+
                 for (const issue of sortedSourceIssues) {
                   const summary = issue.fields.summary;
                   const candidates = summary ? summaryToTargets[summary] : undefined;
                   if (candidates && candidates.length > 0) {
                     // Determine source type category: epic | standard | subtask
                     const srcTypeName = (issue.fields.issuetype?.name || '').toLowerCase();
-                    const srcCategory: 'epic' | 'standard' | 'subtask' = 
+                    const srcCategory: 'epic' | 'standard' | 'subtask' =
                       srcTypeName === 'epic' ? 'epic' :
                       (srcTypeName === 'subtask' || srcTypeName === 'sub-task') ? 'subtask' : 'standard';
-                    
+
                     // Only match compatible type categories (epic↔epic, standard↔standard, subtask↔subtask)
                     const match = candidates.find(c => !claimedTargetKeys.has(c.key) && c.typeCategory === srcCategory);
                     if (match) {
@@ -450,7 +450,7 @@ export async function POST(request: Request) {
                     matchCount.notFound++;
                   }
                 }
-                
+
                 send({ type: "status", message: `Matched ${matchCount.found}/${board.issues.length} issues by summary${matchCount.typeSkipped > 0 ? ` (${matchCount.typeSkipped} type mismatches)` : ''}` });
                 if (matchCount.notFound > 0) {
                   results.warnings.push(`${matchCount.notFound} issues not found in target ${targetProjectKey}`);
@@ -463,13 +463,13 @@ export async function POST(request: Request) {
                 send({ type: "status", message: `Warning: Could not scan target issues: ${scanErr instanceof Error ? scanErr.message : 'Unknown'}` });
               }
             }
-            
+
             // Verify which mapped issues actually exist
             send({ type: "status", message: `Verifying existing issues in ${targetProjectKey}...` });
-            
+
             for (const issue of board.issues) {
               const expectedKey = existingKeyMapping[issue.key];
-              
+
               if (expectedKey) {
                 const exists = await client.issueExists(expectedKey);
                 if (exists) {
@@ -482,10 +482,10 @@ export async function POST(request: Request) {
                 issuesToCreate.push(issue);
               }
             }
-            
-            send({ 
-              type: "status", 
-              message: `Found ${existingIssueKeys.size} existing, ${issuesToCreate.length} to create` 
+
+            send({
+              type: "status",
+              message: `Found ${existingIssueKeys.size} existing, ${issuesToCreate.length} to create`
             });
 
             // updateSprintsOnly: build keyMapping from existing matches, skip issues
@@ -527,7 +527,7 @@ export async function POST(request: Request) {
               if (email) staffEmails.add(email);
             }
           }
-          
+
           if (staffEmails.size > 0) {
             send({ type: "status", message: `Adding ${staffEmails.size} staff members to ${targetProjectKey}...` });
             // Resolve emails to accountIds
@@ -536,7 +536,7 @@ export async function POST(request: Request) {
               const accountId = await client.findUserCached(email);
               if (accountId) staffAccountIds.push(accountId);
             }
-            
+
             if (staffAccountIds.length > 0) {
               const addResult = await client.addStaffToProject(targetProjectKey, staffAccountIds);
               if (addResult.added > 0) {
@@ -558,21 +558,21 @@ export async function POST(request: Request) {
             const bIsSubtask = bType === 'subtask' || bType === 'sub-task';
             const aHasParent = !!a.fields.parent;
             const bHasParent = !!b.fields.parent;
-            
+
             // Epics first
             if (aIsEpic && !bIsEpic) return -1;
             if (!aIsEpic && bIsEpic) return 1;
-            
+
             // Non-subtask without parent before those with parent
             if (!aIsSubtask && !bIsSubtask) {
               if (!aHasParent && bHasParent) return -1;
               if (aHasParent && !bHasParent) return 1;
             }
-            
+
             // Subtasks last
             if (!aIsSubtask && bIsSubtask) return -1;
             if (aIsSubtask && !bIsSubtask) return 1;
-            
+
             // Within same category, sort by key number
             const aNum = parseInt(a.key.split('-')[1]) || 0;
             const bNum = parseInt(b.key.split('-')[1]) || 0;
@@ -582,30 +582,30 @@ export async function POST(request: Request) {
           // Helper to process custom fields for an issue
           const buildCustomFields = (issue: ImportIssue) => {
             const customFields: Record<string, unknown> = {};
-            
+
             const storyPointsValue = issue.fields.customfield_10016
               || issue.fields['Story Points']
               || issue.fields['Story Point Estimate'];
             if (storyPointsValue !== null && storyPointsValue !== undefined && fieldIds.storyPoints) {
               customFields[fieldIds.storyPoints] = storyPointsValue;
             }
-            
+
             const colorValue = issue.fields.customfield_10017;
             if (colorValue && fieldIds.color) {
               customFields[fieldIds.color] = colorValue;
             }
-            
-            const projectWeightValue = issue.fields.customfield_10375 
+
+            const projectWeightValue = issue.fields.customfield_10375
               || issue.fields['Project Weight'];
             if (projectWeightValue !== null && projectWeightValue !== undefined && fieldIds.projectWeight) {
               customFields[fieldIds.projectWeight] = projectWeightValue;
             }
-            
+
             const startDateValue = issue.fields.customfield_10015;
             if (startDateValue && fieldIds.startDate) {
               customFields[fieldIds.startDate] = startDateValue;
             }
-            
+
             return customFields;
           };
 
@@ -613,10 +613,10 @@ export async function POST(request: Request) {
           const resolveAssignee = async (issue: ImportIssue): Promise<string | undefined> => {
             const assignee = issue.fields.assignee;
             if (!assignee) return undefined;
-            
+
             const mappedEmail = getEmailFromDisplayName(assignee.displayName || '');
             const emailToSearch = mappedEmail || assignee.emailAddress;
-            
+
             if (emailToSearch) {
               const foundAccountId = await client.findUserCached(emailToSearch);
               if (foundAccountId) {
@@ -932,7 +932,7 @@ export async function POST(request: Request) {
               } else if (hasParent && !isEpic) {
                 const parentKey = issue.fields.parent?.key;
                 const newParentKey = parentKey ? keyMapping[parentKey] : null;
-                
+
                 created = await client.createIssue(targetProjectKey, {
                   summary: issue.fields.summary,
                   description,
@@ -973,7 +973,7 @@ export async function POST(request: Request) {
               }
 
               keyMapping[issue.key] = created.key;
-              
+
               await updateIssueData(issue, created.key, assigneeAccountId);
 
               results.success.push({ oldKey: issue.key, newKey: created.key, project: targetProjectKey, action: 'created' });
@@ -990,12 +990,12 @@ export async function POST(request: Request) {
             } catch (error) {
               const errorMessage = error instanceof Error ? error.message : "Unknown error";
               console.error(`Import error at ${issue.key}:`, errorMessage);
-              
+
               results.failed.push({
                 oldKey: issue.key,
                 error: errorMessage,
               });
-              
+
               send({
                 type: "status",
                 message: `Failed ${issue.key}: ${errorMessage.slice(0, 100)}`,
@@ -1076,7 +1076,6 @@ export async function POST(request: Request) {
                         startDate: sprint.startDate,
                         endDate: sprint.endDate,
                         goal: sprint.goal,
-                        state: sprint.state,
                       });
                       sprintMapping[sprint.id] = newSprint.id;
                       console.log(`[sprint] Created sprint "${sprint.name}" (${newSprint.id})`);
@@ -1086,44 +1085,100 @@ export async function POST(request: Request) {
                   }
                 }
 
-                // --- REASSIGN: batch issues per sprint for efficiency ---
+                // Build source sprint order map (index in board.sprints array) for chronological sorting
+                const sourceSprintOrder: Record<number, number> = {};
+                board.sprints.forEach((s, idx) => { sourceSprintOrder[s.id] = idx; });
+
+                // --- REASSIGN: move each issue through ALL its sprints in chronological order ---
+                // This ensures Jira records the full sprint history on each ticket.
+                // We build an ordered list of (targetSprintId, issueKeys[]) to process sequentially.
                 const sprintIssuesBatch: Record<number, string[]> = {};
+
                 for (const issue of board.issues) {
                   const newKey = keyMapping[issue.key];
                   if (!newKey) continue;
 
                   const activeSprint = issue.fields.sprint;
-                  const closedSprints = issue.fields.closedSprints;
+                  const closedSprints = issue.fields.closedSprints || [];
 
-                  let targetSprintId: number | null = null;
+                  // Collect all sprints this issue belongs to
+                  const allSprints: { id: number; order: number }[] = [];
+                  for (const cs of closedSprints) {
+                    if (sprintMapping[cs.id]) {
+                      allSprints.push({ id: cs.id, order: sourceSprintOrder[cs.id] ?? -1 });
+                    }
+                  }
                   if (activeSprint && sprintMapping[activeSprint.id]) {
-                    targetSprintId = sprintMapping[activeSprint.id];
-                  } else if (closedSprints && closedSprints.length > 0) {
-                    for (const cs of closedSprints) {
-                      if (sprintMapping[cs.id]) {
-                        targetSprintId = sprintMapping[cs.id];
-                        break;
-                      }
+                    // Avoid duplicates if active sprint is also in closedSprints
+                    if (!allSprints.some(s => s.id === activeSprint.id)) {
+                      allSprints.push({ id: activeSprint.id, order: sourceSprintOrder[activeSprint.id] ?? Infinity });
                     }
                   }
 
-                  if (targetSprintId) {
-                    if (!sprintIssuesBatch[targetSprintId]) sprintIssuesBatch[targetSprintId] = [];
-                    sprintIssuesBatch[targetSprintId].push(newKey);
+                  // Sort chronologically by source sprint order
+                  allSprints.sort((a, b) => a.order - b.order);
+
+                  // Add issue to each sprint batch in order
+                  for (const s of allSprints) {
+                    const targetId = sprintMapping[s.id];
+                    if (!sprintIssuesBatch[targetId]) sprintIssuesBatch[targetId] = [];
+                    sprintIssuesBatch[targetId].push(newKey);
                   }
                 }
 
-                // Move issues in batches per sprint
+                // --- Process sprints in chronological order: start → move issues → close ---
+                // This is the correct sequence to record full sprint history on each ticket.
+                // Jira only records sprint history when issues are moved WHILE the sprint is active,
+                // so we must: start the sprint, move issues in, then close it (for closed sprints).
+                // Jira only allows one active sprint at a time, so we process sequentially.
                 let sprintAssigned = 0;
-                for (const [sprintIdStr, issueKeys] of Object.entries(sprintIssuesBatch)) {
-                  const sprintId = Number(sprintIdStr);
+                for (const sprint of board.sprints) {
+                  const targetSprintId = sprintMapping[sprint.id];
+                  if (!targetSprintId) continue;
+
+                  const issueKeys = sprintIssuesBatch[targetSprintId];
+                  const existing = existingSprints.find(s => s.id === targetSprintId);
+
+                  // Re-fetch the current sprint state to get up-to-date status
+                  // (earlier sprints in this loop may have changed state)
+                  let currentState: 'active' | 'closed' | 'future' = (existing?.state as 'active' | 'closed' | 'future') ?? 'future';
                   try {
-                    await client.moveIssuesToSprint(sprintId, issueKeys);
-                    sprintAssigned += issueKeys.length;
-                  } catch (err) {
-                    results.warnings.push(`Sprint ${sprintId}: failed to move ${issueKeys.length} issues: ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
+                    const freshSprint = await client.getSprint(targetSprintId);
+                    currentState = freshSprint.state as 'active' | 'closed' | 'future';
+                  } catch { /* use cached state */ }
+
+                  send({ type: "status", message: `Processing sprint "${sprint.name}" (source=${sprint.state})` });
+
+                  // Step 1: Start the sprint if it's still in future state
+                  if (currentState === 'future' && (sprint.state === 'active' || sprint.state === 'closed') && sprint.startDate && sprint.endDate) {
+                    try {
+                      await client.startSprint(targetSprintId, sprint.startDate, sprint.endDate);
+                      currentState = 'active';
+                    } catch (err) {
+                      results.warnings.push(`Sprint start "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
+                    }
+                  }
+
+                  // Step 2: Move issues into this sprint (only while it's active, so history is recorded)
+                  if (issueKeys && issueKeys.length > 0 && currentState !== 'closed') {
+                    try {
+                      await client.moveIssuesToSprint(targetSprintId, issueKeys);
+                      sprintAssigned += issueKeys.length;
+                    } catch (err) {
+                      results.warnings.push(`Sprint ${targetSprintId}: failed to move ${issueKeys.length} issues: ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
+                    }
+                  }
+
+                  // Step 3: Close the sprint if it was closed in source
+                  if (sprint.state === 'closed' && currentState !== 'closed') {
+                    try {
+                      await client.closeSprint(targetSprintId);
+                    } catch (err) {
+                      results.warnings.push(`Sprint close "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
+                    }
                   }
                 }
+
                 if (reimportOpts.updateSprintsOnly) {
                   send({ type: "status", message: `Sprint reassign complete: ${sprintAssigned} issues moved to ${Object.keys(sprintIssuesBatch).length} sprints` });
                 }
@@ -1155,7 +1210,7 @@ export async function POST(request: Request) {
           } else {
           send({ type: "status", message: `${reimportMode ? 'Updating' : 'Creating'} issue links for ${targetProjectKey}...`, phase: "links" });
           const processedLinks = new Set<string>(); // Avoid duplicate links
-          
+
           // Pass 1: Delete ALL existing links from all issues first
           if (reimportMode) {
             send({ type: "status", message: `Deleting old links for ${targetProjectKey}...`, phase: "links" });
@@ -1193,7 +1248,7 @@ export async function POST(request: Request) {
                 if (link.outwardIssue) {
                   const oldTargetKey = link.outwardIssue.key;
                   const newTargetKey = keyMapping[oldTargetKey];
-                  
+
                   if (newTargetKey) {
                     const linkId = `${newSourceKey}-${link.type.name}-${newTargetKey}`;
                     if (!processedLinks.has(linkId)) {
@@ -1286,7 +1341,7 @@ async function handleNonStreamingImport(params: {
   };
 
   const client = new JiraClient({ domain, email, apiToken });
-  
+
   const results: {
     success: { oldKey: string; newKey: string; project: string; action: 'created' | 'updated' }[];
     failed: { oldKey: string; error: string }[];
@@ -1309,7 +1364,7 @@ async function handleNonStreamingImport(params: {
       const sourceProjectKey = board.project?.projectKey;
       const sourceProjectName = board.project?.projectName;
       const targetProjectKey = sourceProjectKey ? projectMapping[sourceProjectKey] : null;
-      
+
       if (targetProjectKey && sourceProjectKey === targetProjectKey) {
         const exists = await client.projectExists(targetProjectKey);
         if (!exists) {
@@ -1333,7 +1388,7 @@ async function handleNonStreamingImport(params: {
   for (const board of importData.boards) {
     const sourceProjectKey = board.project?.projectKey;
     const targetProjectKey = sourceProjectKey ? projectMapping[sourceProjectKey] : null;
-    
+
     if (!targetProjectKey) {
       for (const issue of board.issues) {
         results.failed.push({
@@ -1420,7 +1475,7 @@ async function handleNonStreamingImport(params: {
 
         const mappedIssueType = mapIssueType(originalIssueType);
         const isEpic = mappedIssueType.toLowerCase() === 'epic';
-        
+
         const issueNum = issue.key.split('-')[1];
         const expectedNewKey = `${targetProjectKey}-${issueNum}`;
 
@@ -1549,7 +1604,7 @@ async function handleNonStreamingImport(params: {
           oldKey: issue.key,
           error: error instanceof Error ? error.message : "Unknown error",
         });
-        
+
         return new Response(JSON.stringify({
           ...results,
           keyMapping,
@@ -1566,48 +1621,99 @@ async function handleNonStreamingImport(params: {
         const targetBoard = targetBoards[0];
 
         if (targetBoard) {
+          const existingSprints = await client.getAllBoardSprints(targetBoard.id);
+          const existingSprintByName: Record<string, { id: number }> = {};
+          for (const s of existingSprints) {
+            existingSprintByName[s.name] = { id: s.id };
+          }
+
           const sprintMapping: Record<number, number> = {};
 
           for (const sprint of board.sprints) {
             try {
-              const newSprint = await client.createSprint(targetBoard.id, {
-                name: sprint.name,
-                startDate: sprint.startDate,
-                endDate: sprint.endDate,
-                goal: sprint.goal,
-                state: sprint.state, // Pass state to start/close sprint
-              });
-              sprintMapping[sprint.id] = newSprint.id;
+              const existing = existingSprintByName[sprint.name];
+              if (existing) {
+                sprintMapping[sprint.id] = existing.id;
+              } else {
+                const newSprint = await client.createSprint(targetBoard.id, {
+                  name: sprint.name,
+                  startDate: sprint.startDate,
+                  endDate: sprint.endDate,
+                  goal: sprint.goal,
+                });
+                sprintMapping[sprint.id] = newSprint.id;
+              }
             } catch {
               // Continue
             }
           }
 
+          // Build source sprint order map
+          const sourceSprintOrder: Record<number, number> = {};
+          board.sprints.forEach((s, idx) => { sourceSprintOrder[s.id] = idx; });
+
+          // Build sprint → issue batches (all sprints each issue belongs to)
+          const sprintIssuesBatch: Record<number, string[]> = {};
           for (const issue of board.issues) {
             const newKey = keyMapping[issue.key];
             if (!newKey) continue;
 
             const activeSprint = issue.fields.sprint;
-            const closedSprints = issue.fields.closedSprints;
+            const closedSprints = issue.fields.closedSprints || [];
 
-            let targetSprintId: number | null = null;
-            if (activeSprint && sprintMapping[activeSprint.id]) {
-              targetSprintId = sprintMapping[activeSprint.id];
-            } else if (closedSprints && closedSprints.length > 0) {
-              for (const cs of closedSprints) {
-                if (sprintMapping[cs.id]) {
-                  targetSprintId = sprintMapping[cs.id];
-                  break;
-                }
+            const allSprints: { id: number; order: number }[] = [];
+            for (const cs of closedSprints) {
+              if (sprintMapping[cs.id]) {
+                allSprints.push({ id: cs.id, order: sourceSprintOrder[cs.id] ?? -1 });
               }
             }
-
-            if (targetSprintId) {
-              try {
-                await client.moveIssuesToSprint(targetSprintId, [newKey]);
-              } catch {
-                // Continue
+            if (activeSprint && sprintMapping[activeSprint.id]) {
+              if (!allSprints.some(s => s.id === activeSprint.id)) {
+                allSprints.push({ id: activeSprint.id, order: sourceSprintOrder[activeSprint.id] ?? Infinity });
               }
+            }
+            allSprints.sort((a, b) => a.order - b.order);
+
+            for (const s of allSprints) {
+              const targetId = sprintMapping[s.id];
+              if (!sprintIssuesBatch[targetId]) sprintIssuesBatch[targetId] = [];
+              sprintIssuesBatch[targetId].push(newKey);
+            }
+          }
+
+          // Process sprints in chronological order: start → move issues → close
+          for (const sprint of board.sprints) {
+            const targetSprintId = sprintMapping[sprint.id];
+            if (!targetSprintId) continue;
+
+            const issueKeys = sprintIssuesBatch[targetSprintId];
+
+            let currentState: 'active' | 'closed' | 'future' = 'future';
+            try {
+              const freshSprint = await client.getSprint(targetSprintId);
+              currentState = freshSprint.state as 'active' | 'closed' | 'future';
+            } catch { /* default to future */ }
+
+            // Step 1: Start if future
+            if (currentState === 'future' && (sprint.state === 'active' || sprint.state === 'closed') && sprint.startDate && sprint.endDate) {
+              try {
+                await client.startSprint(targetSprintId, sprint.startDate, sprint.endDate);
+                currentState = 'active';
+              } catch { /* continue */ }
+            }
+
+            // Step 2: Move issues while active
+            if (issueKeys && issueKeys.length > 0 && currentState !== 'closed') {
+              try {
+                await client.moveIssuesToSprint(targetSprintId, issueKeys);
+              } catch { /* continue */ }
+            }
+
+            // Step 3: Close if source was closed
+            if (sprint.state === 'closed' && currentState !== 'closed') {
+              try {
+                await client.closeSprint(targetSprintId);
+              } catch { /* continue */ }
             }
           }
         }
@@ -1632,7 +1738,7 @@ async function handleNonStreamingImport(params: {
 
     // Handle issue links (after all issues are created)
     const processedLinks = new Set<string>();
-    
+
     for (const issue of board.issues) {
       const issuelinks = issue.fields.issuelinks;
       if (!issuelinks || issuelinks.length === 0) continue;
@@ -1645,7 +1751,7 @@ async function handleNonStreamingImport(params: {
           if (link.outwardIssue) {
             const oldTargetKey = link.outwardIssue.key;
             const newTargetKey = keyMapping[oldTargetKey];
-            
+
             if (newTargetKey) {
               const linkId = `${newSourceKey}-${link.type.name}-${newTargetKey}`;
               if (!processedLinks.has(linkId)) {
