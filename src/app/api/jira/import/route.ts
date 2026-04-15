@@ -1056,10 +1056,12 @@ export async function POST(request: Request) {
                 }
 
                 // Build name → id map from (deduped) existing sprints
-                const existingSprintByName: Record<string, { id: number }> = {};
+                const existingSprintByName: Record<string, { id: number; state: string }> = {};
                 for (const s of existingSprints) {
-                  existingSprintByName[s.name] = { id: s.id };
+                  existingSprintByName[s.name] = { id: s.id, state: s.state };
                 }
+
+                send({ type: "status", message: `Existing sprints on target board: ${existingSprints.map(s => `${s.name}(${s.state})`).join(', ')}` });
 
                 const sprintMapping: Record<number, number> = {};
 
@@ -1069,7 +1071,7 @@ export async function POST(request: Request) {
                     const existing = existingSprintByName[sprint.name];
                     if (existing) {
                       sprintMapping[sprint.id] = existing.id;
-                      console.log(`[sprint] Reusing existing sprint "${sprint.name}" (${existing.id})`);
+                      send({ type: "status", message: `Sprint "${sprint.name}": reusing target id=${existing.id} (state=${existing.state})` });
                     } else {
                       const newSprint = await client.createSprint(targetBoard.id, {
                         name: sprint.name,
@@ -1078,10 +1080,10 @@ export async function POST(request: Request) {
                         goal: sprint.goal,
                       });
                       sprintMapping[sprint.id] = newSprint.id;
-                      console.log(`[sprint] Created sprint "${sprint.name}" (${newSprint.id})`);
+                      send({ type: "status", message: `Sprint "${sprint.name}": created target id=${newSprint.id}` });
                     }
-                  } catch {
-                    // Continue
+                  } catch (err) {
+                    results.warnings.push(`Sprint create/reuse "${sprint.name}": ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
                   }
                 }
 
@@ -1126,6 +1128,13 @@ export async function POST(request: Request) {
                   }
                 }
 
+                // Log sprint batches for debugging
+                send({ type: "status", message: `Sprint batches built: ${Object.keys(sprintIssuesBatch).length} sprints, ${Object.values(sprintIssuesBatch).reduce((sum, arr) => sum + arr.length, 0)} total issue-sprint assignments` });
+                for (const [sprintId, keys] of Object.entries(sprintIssuesBatch)) {
+                  const sprintName = board.sprints.find(s => sprintMapping[s.id] === Number(sprintId))?.name || '?';
+                  send({ type: "status", message: `  Sprint "${sprintName}" (target=${sprintId}): ${keys.length} issues` });
+                }
+
                 // --- Process sprints in chronological order: start → move issues → close ---
                 // This is the correct sequence to record full sprint history on each ticket.
                 // Jira only records sprint history when issues are moved WHILE the sprint is active,
@@ -1133,10 +1142,10 @@ export async function POST(request: Request) {
                 // Jira only allows one active sprint at a time, so we process sequentially.
                 let sprintAssigned = 0;
                 for (const sprint of board.sprints) {
-                  const targetSprintId = sprintMapping[sprint.id];
+                  let targetSprintId = sprintMapping[sprint.id];
                   if (!targetSprintId) continue;
 
-                  const issueKeys = sprintIssuesBatch[targetSprintId];
+                  let issueKeys = sprintIssuesBatch[targetSprintId];
                   const existing = existingSprints.find(s => s.id === targetSprintId);
 
                   // Re-fetch the current sprint state to get up-to-date status
@@ -1147,34 +1156,72 @@ export async function POST(request: Request) {
                     currentState = freshSprint.state as 'active' | 'closed' | 'future';
                   } catch { /* use cached state */ }
 
-                  send({ type: "status", message: `Processing sprint "${sprint.name}" (source=${sprint.state})` });
+                  send({ type: "status", message: `Sprint "${sprint.name}": target=${targetSprintId}, current=${currentState}, source=${sprint.state}, issues=${issueKeys?.length || 0}` });
 
-                  // Step 1: Start the sprint if it's still in future state
+                  const needsMoveIssues = issueKeys && issueKeys.length > 0;
+                  const needsClose = sprint.state === 'closed';
+
+                  // Step 1: If sprint is closed but we need to move issues, delete & recreate
+                  if (currentState === 'closed' && needsMoveIssues) {
+                    try {
+                      send({ type: "status", message: `  → Recreating closed sprint "${sprint.name}" to move issues...` });
+                      const oldId = targetSprintId;
+                      const newId = await client.reopenSprint(targetSprintId, targetBoard.id);
+                      // Update all references to new sprint id
+                      targetSprintId = newId;
+                      sprintMapping[sprint.id] = newId;
+                      // Move issueKeys reference to new id
+                      if (oldId !== newId) {
+                        sprintIssuesBatch[newId] = issueKeys;
+                        issueKeys = sprintIssuesBatch[newId];
+                      }
+                      currentState = 'active';
+                      send({ type: "status", message: `  ✓ Sprint "${sprint.name}" recreated as id=${newId}` });
+                    } catch (err) {
+                      const msg = `Sprint reopen "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 120) : 'unknown'}`;
+                      results.warnings.push(msg);
+                      send({ type: "status", message: `  ✗ ${msg}` });
+                    }
+                  }
+
+                  // Step 2: Start the sprint if it's still in future state
                   if (currentState === 'future' && (sprint.state === 'active' || sprint.state === 'closed') && sprint.startDate && sprint.endDate) {
                     try {
+                      send({ type: "status", message: `  → Starting sprint "${sprint.name}" (endDate=${sprint.endDate})...` });
                       await client.startSprint(targetSprintId, sprint.startDate, sprint.endDate);
                       currentState = 'active';
+                      send({ type: "status", message: `  ✓ Sprint "${sprint.name}" started` });
                     } catch (err) {
-                      results.warnings.push(`Sprint start "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
+                      const msg = `Sprint start "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 120) : 'unknown'}`;
+                      results.warnings.push(msg);
+                      send({ type: "status", message: `  ✗ ${msg}` });
                     }
                   }
 
-                  // Step 2: Move issues into this sprint (only while it's active, so history is recorded)
-                  if (issueKeys && issueKeys.length > 0 && currentState !== 'closed') {
+                  // Step 3: Move issues into this sprint (only while it's active, so history is recorded)
+                  if (needsMoveIssues && currentState === 'active') {
                     try {
+                      send({ type: "status", message: `  → Moving ${issueKeys.length} issues into sprint "${sprint.name}"...` });
                       await client.moveIssuesToSprint(targetSprintId, issueKeys);
                       sprintAssigned += issueKeys.length;
+                      send({ type: "status", message: `  ✓ Moved ${issueKeys.length} issues` });
                     } catch (err) {
-                      results.warnings.push(`Sprint ${targetSprintId}: failed to move ${issueKeys.length} issues: ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
+                      const msg = `Sprint ${targetSprintId}: failed to move ${issueKeys.length} issues: ${err instanceof Error ? err.message.slice(0, 120) : 'unknown'}`;
+                      results.warnings.push(msg);
+                      send({ type: "status", message: `  ✗ ${msg}` });
                     }
                   }
 
-                  // Step 3: Close the sprint if it was closed in source
-                  if (sprint.state === 'closed' && currentState !== 'closed') {
+                  // Step 4: Close the sprint if it was closed in source
+                  if (needsClose && currentState !== 'closed') {
                     try {
+                      send({ type: "status", message: `  → Closing sprint "${sprint.name}"...` });
                       await client.closeSprint(targetSprintId);
+                      send({ type: "status", message: `  ✓ Sprint "${sprint.name}" closed` });
                     } catch (err) {
-                      results.warnings.push(`Sprint close "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
+                      const msg = `Sprint close "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 120) : 'unknown'}`;
+                      results.warnings.push(msg);
+                      send({ type: "status", message: `  ✗ ${msg}` });
                     }
                   }
                 }
@@ -1183,8 +1230,9 @@ export async function POST(request: Request) {
                   send({ type: "status", message: `Sprint reassign complete: ${sprintAssigned} issues moved to ${Object.keys(sprintIssuesBatch).length} sprints` });
                 }
               }
-            } catch {
-              // Continue
+            } catch (sprintErr) {
+              results.warnings.push(`Sprint sync failed for ${targetProjectKey}: ${sprintErr instanceof Error ? sprintErr.message.slice(0, 80) : 'unknown'}`);
+              send({ type: "status", message: `Sprint sync error: ${sprintErr instanceof Error ? sprintErr.message.slice(0, 100) : 'unknown'}` });
             }
           }
 
@@ -1643,8 +1691,8 @@ async function handleNonStreamingImport(params: {
                 });
                 sprintMapping[sprint.id] = newSprint.id;
               }
-            } catch {
-              // Continue
+            } catch (err) {
+              results.warnings.push(`Sprint create/reuse "${sprint.name}": ${err instanceof Error ? err.message.slice(0, 60) : 'unknown'}`);
             }
           }
 
@@ -1681,12 +1729,12 @@ async function handleNonStreamingImport(params: {
             }
           }
 
-          // Process sprints in chronological order: start → move issues → close
+          // Process sprints in chronological order: reopen if needed → start → move issues → close
           for (const sprint of board.sprints) {
-            const targetSprintId = sprintMapping[sprint.id];
+            let targetSprintId = sprintMapping[sprint.id];
             if (!targetSprintId) continue;
 
-            const issueKeys = sprintIssuesBatch[targetSprintId];
+            let issueKeys = sprintIssuesBatch[targetSprintId];
 
             let currentState: 'active' | 'closed' | 'future' = 'future';
             try {
@@ -1694,26 +1742,54 @@ async function handleNonStreamingImport(params: {
               currentState = freshSprint.state as 'active' | 'closed' | 'future';
             } catch { /* default to future */ }
 
-            // Step 1: Start if future
+            const needsMoveIssues = issueKeys && issueKeys.length > 0;
+            const needsClose = sprint.state === 'closed';
+
+            // Step 1: If sprint is closed but we need to move issues, delete & recreate
+            if (currentState === 'closed' && needsMoveIssues) {
+              try {
+                const oldId = targetSprintId;
+                const newId = await client.reopenSprint(targetSprintId, targetBoard.id);
+                // Update all references to new sprint id
+                targetSprintId = newId;
+                sprintMapping[sprint.id] = newId;
+                // Move issueKeys reference to new id
+                if (oldId !== newId) {
+                  sprintIssuesBatch[newId] = issueKeys;
+                  issueKeys = sprintIssuesBatch[newId];
+                }
+                currentState = 'active';
+              } catch (err) {
+                results.warnings.push(`Sprint reopen "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 120) : 'unknown'}`);
+              }
+            }
+
+            // Step 2: Start if future
             if (currentState === 'future' && (sprint.state === 'active' || sprint.state === 'closed') && sprint.startDate && sprint.endDate) {
               try {
                 await client.startSprint(targetSprintId, sprint.startDate, sprint.endDate);
                 currentState = 'active';
-              } catch { /* continue */ }
+              } catch (err) {
+                results.warnings.push(`Sprint start "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 120) : 'unknown'}`);
+              }
             }
 
-            // Step 2: Move issues while active
-            if (issueKeys && issueKeys.length > 0 && currentState !== 'closed') {
+            // Step 3: Move issues while active
+            if (needsMoveIssues && currentState === 'active') {
               try {
                 await client.moveIssuesToSprint(targetSprintId, issueKeys);
-              } catch { /* continue */ }
+              } catch (err) {
+                results.warnings.push(`Sprint ${targetSprintId}: failed to move ${issueKeys.length} issues: ${err instanceof Error ? err.message.slice(0, 120) : 'unknown'}`);
+              }
             }
 
-            // Step 3: Close if source was closed
-            if (sprint.state === 'closed' && currentState !== 'closed') {
+            // Step 4: Close if source was closed
+            if (needsClose && currentState !== 'closed') {
               try {
                 await client.closeSprint(targetSprintId);
-              } catch { /* continue */ }
+              } catch (err) {
+                results.warnings.push(`Sprint close "${sprint.name}" (${targetSprintId}): ${err instanceof Error ? err.message.slice(0, 120) : 'unknown'}`);
+              }
             }
           }
         }

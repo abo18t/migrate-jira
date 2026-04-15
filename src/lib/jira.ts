@@ -1284,13 +1284,30 @@ export class JiraClient {
   }
 
   // Start a sprint
+  // If endDate is in the past, Jira rejects the start request.
+  // In that case, use a temporary future endDate so Jira accepts it.
+  // The caller is expected to close the sprint immediately after for historical sprints.
   async startSprint(sprintId: number, startDate: string, endDate: string): Promise<void> {
+    let effectiveStartDate = startDate;
+    let effectiveEndDate = endDate;
+
+    const now = new Date();
+    const end = new Date(endDate);
+    if (end.getTime() < now.getTime()) {
+      // endDate is in the past — Jira won't allow starting with a past endDate.
+      // Use "now" as startDate and "now + 14 days" as endDate so the API accepts it.
+      // The sprint will be closed immediately after, so these dates are just temporary.
+      const tempEnd = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+      effectiveStartDate = now.toISOString();
+      effectiveEndDate = tempEnd.toISOString();
+    }
+
     await this.fetch(`/rest/agile/1.0/sprint/${sprintId}`, {
       method: "POST",
       body: JSON.stringify({
         state: "active",
-        startDate,
-        endDate,
+        startDate: effectiveStartDate,
+        endDate: effectiveEndDate,
       }),
     });
   }
@@ -1303,6 +1320,43 @@ export class JiraClient {
         state: "closed",
       }),
     });
+  }
+
+  // Reopen a closed sprint (set back to active) so issues can be moved in.
+  // Closed sprints have a completeDate — startDate must be before completeDate.
+  // Strategy: delete the closed sprint and create a new one with the same name,
+  // then start it with temporary future dates. The caller will close it after moving issues.
+  async reopenSprint(sprintId: number, boardId: number): Promise<number> {
+    // Fetch sprint details first
+    const sprint = await this.getSprint(sprintId);
+
+    // Delete the closed sprint
+    await this.fetch(`/rest/agile/1.0/sprint/${sprintId}`, {
+      method: "DELETE",
+    });
+
+    // Create a new sprint with the same name
+    const newSprint = await this.fetch<{ id: number }>("/rest/agile/1.0/sprint", {
+      method: "POST",
+      body: JSON.stringify({
+        name: sprint.name,
+        originBoardId: boardId,
+      }),
+    });
+
+    // Start it with temporary future dates
+    const now = new Date();
+    const tempEnd = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+    await this.fetch(`/rest/agile/1.0/sprint/${newSprint.id}`, {
+      method: "POST",
+      body: JSON.stringify({
+        state: "active",
+        startDate: now.toISOString(),
+        endDate: tempEnd.toISOString(),
+      }),
+    });
+
+    return newSprint.id;
   }
 
   // Get a single sprint by ID (to get up-to-date state)
