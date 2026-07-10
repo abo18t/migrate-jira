@@ -50,11 +50,12 @@ interface JiraProject {
   projectTypeKey: string;
 }
 
-type Mode = "select" | "export" | "import" | "attachments" | "fix-worklogs";
+type Mode = "select" | "export" | "import" | "attachments" | "fix-worklogs" | "edit-worklogs";
 type ExportStep = "credentials" | "boards" | "exporting" | "complete";
 type ImportStep = "credentials" | "upload" | "project" | "importing" | "complete";
 type AttachmentStep = "credentials" | "scan" | "scanning" | "transfer" | "transferring" | "complete";
 type FixWorklogStep = "credentials" | "config" | "scanning" | "review" | "fixing" | "complete";
+type EditWorklogStep = "credentials" | "files" | "mapping" | "running" | "complete";
 
 export default function Home() {
   const [mode, setMode] = useState<Mode>("select");
@@ -68,6 +69,7 @@ export default function Home() {
   });
   const [boards, setBoards] = useState<JiraBoard[]>([]);
   const [selectedBoardIds, setSelectedBoardIds] = useState<number[]>([]);
+  const [boardUrlInput, setBoardUrlInput] = useState("");
   const [exportedData, setExportedData] = useState<{
     projectKey: string;
     data: unknown;
@@ -165,6 +167,28 @@ export default function Home() {
     fixed: 0,
     failed: 0,
   });
+
+  // Edit Worklogs (standalone re-sync) state
+  const [editWlStep, setEditWlStep] = useState<EditWorklogStep>("credentials");
+  const [editWlCredentials, setEditWlCredentials] = useState({
+    domain: "enotion",
+    email: "",
+    apiToken: "",
+  });
+  const [editWlImportData, setEditWlImportData] = useState<{
+    boards: {
+      name: string;
+      project?: { projectKey: string; projectName: string };
+      issues: { key: string; worklogs?: unknown[] }[];
+    }[];
+  } | null>(null);
+  const [editWlImportFileName, setEditWlImportFileName] = useState<string>("");
+  const [editWlSourceProjects, setEditWlSourceProjects] = useState<{ key: string; name: string }[]>([]);
+  const [editWlTargetProjects, setEditWlTargetProjects] = useState<{ key: string; name: string }[]>([]);
+  const [editWlProjectMapping, setEditWlProjectMapping] = useState<Record<string, string>>({});
+  const [editWlProgress, setEditWlProgress] = useState({ message: "", issueIndex: 0, totalIssues: 0 });
+  const [editWlLog, setEditWlLog] = useState<string[]>([]);
+  const [editWlResult, setEditWlResult] = useState<{ synced: number; failed: number; worklogsAdded: number; worklogsDeleted: number; worklogsSkipped: number; total: number } | null>(null);
   
   // Import progress state
   const [importProgress, setImportProgress] = useState({
@@ -209,8 +233,14 @@ export default function Home() {
         apiToken: savedExportToken || '',
         domain: savedExportDomain || prev.domain,
       }));
-      setImportCredentials(prev => ({ 
-        ...prev, 
+      setImportCredentials(prev => ({
+        ...prev,
+        email: savedEmail,
+        apiToken: savedImportToken || '',
+        domain: savedImportDomain || prev.domain,
+      }));
+      setEditWlCredentials(prev => ({
+        ...prev,
         email: savedEmail,
         apiToken: savedImportToken || '',
         domain: savedImportDomain || prev.domain,
@@ -302,6 +332,15 @@ export default function Home() {
 
   const selectAllBoards = () => setSelectedBoardIds(boards.map((b) => b.id));
   const deselectAllBoards = () => setSelectedBoardIds([]);
+
+  const selectBoardsFromUrls = () => {
+    const matches = boardUrlInput.matchAll(/\/boards\/(\d+)/g);
+    const idsFromUrls = [...matches].map(m => parseInt(m[1]));
+    const validIds = idsFromUrls.filter(id => boards.some(b => b.id === id));
+    if (validIds.length > 0) {
+      setSelectedBoardIds(prev => [...new Set([...prev, ...validIds])]);
+    }
+  };
 
   const exportBoards = async () => {
     if (selectedBoardIds.length === 0) {
@@ -863,6 +902,15 @@ export default function Home() {
     setWorklogsToFix([]);
     setFixWorklogProjects("");
     setFixWorklogKeyMapping("");
+    setEditWlStep("credentials");
+    setEditWlImportData(null);
+    setEditWlImportFileName("");
+    setEditWlSourceProjects([]);
+    setEditWlTargetProjects([]);
+    setEditWlProjectMapping({});
+    setEditWlResult(null);
+    setEditWlProgress({ message: "", issueIndex: 0, totalIssues: 0 });
+    setEditWlLog([]);
     setError("");
   };
 
@@ -992,6 +1040,157 @@ export default function Home() {
     }
   };
 
+  // Edit Worklogs (standalone mode) handlers
+  const testEditWlConnection = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch("/api/jira/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(editWlCredentials),
+      });
+      const data = await response.json();
+      if (data.success) {
+        setEditWlStep("files");
+      } else {
+        setError(data.error || "Connection failed");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Connection failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleEditWlExportUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError("");
+    setEditWlImportFileName(file.name);
+    try {
+      const text = await file.text();
+      if (!text.trim()) throw new Error("File is empty");
+      const data = JSON.parse(text);
+      if (!data.boards || !Array.isArray(data.boards)) {
+        throw new Error("Not an export JSON (missing boards[])");
+      }
+      setEditWlImportData(data);
+
+      // Build unique source projects from the file
+      const seen = new Set<string>();
+      const sources: { key: string; name: string }[] = [];
+      for (const b of data.boards as Array<{ project?: { projectKey?: string; projectName?: string } }>) {
+        const k = b.project?.projectKey;
+        if (k && !seen.has(k)) {
+          seen.add(k);
+          sources.push({ key: k, name: b.project?.projectName || k });
+        }
+      }
+      setEditWlSourceProjects(sources);
+      setEditWlProjectMapping({});
+    } catch (err) {
+      setError(`Failed to parse ${file.name}: ${err instanceof Error ? err.message : "invalid JSON"}`);
+      setEditWlImportData(null);
+      setEditWlImportFileName("");
+      setEditWlSourceProjects([]);
+    }
+  };
+
+  const loadEditWlTargetProjects = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch("/api/jira/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(editWlCredentials),
+      });
+      const data = await response.json();
+      if (data.projects) {
+        const list = (data.projects as Array<{ key: string; name: string }>).map(p => ({ key: p.key, name: p.name }));
+        setEditWlTargetProjects(list);
+        // Auto-map: if same key exists in target, pre-select it
+        const targetSet = new Set(list.map(p => p.key));
+        const initial: Record<string, string> = {};
+        for (const sp of editWlSourceProjects) {
+          if (targetSet.has(sp.key)) initial[sp.key] = sp.key;
+        }
+        setEditWlProjectMapping(initial);
+        setEditWlStep("mapping");
+      } else {
+        setError(data.error || "Failed to load projects");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load projects");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runEditWorklogs = async () => {
+    if (!editWlImportData || Object.keys(editWlProjectMapping).length === 0) return;
+    setEditWlStep("running");
+    setEditWlResult(null);
+    setEditWlProgress({ message: "Starting...", issueIndex: 0, totalIssues: 0 });
+    setEditWlLog([]);
+    setError("");
+
+    try {
+      const response = await fetch("/api/jira/worklogs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...editWlCredentials,
+          projectMapping: editWlProjectMapping,
+          importData: editWlImportData,
+          safeMode: true,
+        }),
+      });
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response stream");
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalResult: { synced: number; failed: number; worklogsAdded: number; worklogsDeleted: number; worklogsSkipped: number; total: number } | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.type === "progress" || data.type === "status") {
+              setEditWlProgress(prev => ({
+                message: data.message || prev.message,
+                issueIndex: data.issueIndex ?? prev.issueIndex,
+                totalIssues: data.totalIssues ?? prev.totalIssues,
+              }));
+              if (data.message) {
+                const ts = new Date().toLocaleTimeString();
+                setEditWlLog(prev => [...prev.slice(-499), `[${ts}] ${data.message}`]);
+              }
+            } else if (data.type === "complete") {
+              finalResult = data.results;
+            } else if (data.type === "error") {
+              throw new Error(data.message);
+            }
+          } catch { /* skip */ }
+        }
+      }
+
+      setEditWlResult(finalResult);
+      setEditWlStep("complete");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Edit worklogs failed");
+      setEditWlStep("mapping");
+    }
+  };
+
   // Reset export but keep credentials
   const resetExport = () => {
     setExportStep("boards");
@@ -1104,6 +1303,26 @@ export default function Home() {
                 <Button variant="outline" className="w-full">Fix Worklogs</Button>
               </CardContent>
             </Card>}
+
+            <Card
+              className="cursor-pointer hover:border-orange-500 transition-colors"
+              onClick={() => setMode("edit-worklogs")}
+            >
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <svg className="w-6 h-6 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  Edit Worklogs
+                </CardTitle>
+                <CardDescription>
+                  Re-sync worklogs standalone from an export JSON + audit log (no issue/comment/sprint changes)
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <Button variant="outline" className="w-full">Edit Worklogs</Button>
+              </CardContent>
+            </Card>
           </div>
         </div>
       </div>
@@ -1119,18 +1338,21 @@ export default function Home() {
           </Button>
           <div className="text-center">
             <h1 className="text-3xl font-bold text-zinc-900 dark:text-zinc-100">
-              {mode === "export" ? "Export from Jira" : 
-               mode === "import" ? "Import to Jira" : 
+              {mode === "export" ? "Export from Jira" :
+               mode === "import" ? "Import to Jira" :
                mode === "attachments" ? "Transfer Attachments" :
+               mode === "edit-worklogs" ? "Edit Worklogs" :
                "Fix Worklogs"}
             </h1>
             <p className="text-zinc-600 dark:text-zinc-400 mt-2">
-              {mode === "export" 
+              {mode === "export"
                 ? `Export from ${exportCredentials.domain}.atlassian.net`
                 : mode === "import"
                 ? `Import to ${importCredentials.domain}.atlassian.net`
                 : mode === "attachments"
                 ? "Transfer attachments between workspaces"
+                : mode === "edit-worklogs"
+                ? `Re-sync worklogs in ${editWlCredentials.domain}.atlassian.net`
                 : `Fix worklogs in ${importCredentials.domain}.atlassian.net`
               }
             </p>
@@ -1251,6 +1473,22 @@ export default function Home() {
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
+                  <div className="mb-4 space-y-2">
+                    <Label htmlFor="board-urls">Paste Board URLs (one per line)</Label>
+                    <textarea
+                      id="board-urls"
+                      className="w-full h-24 p-2 text-sm border rounded-md border-zinc-200 dark:border-zinc-800 bg-transparent resize-y font-mono"
+                      placeholder="https://seastudio.atlassian.net/jira/software/projects/KTA2979/boards/2398"
+                      value={boardUrlInput}
+                      onChange={(e) => setBoardUrlInput(e.target.value)}
+                    />
+                    <Button variant="outline" size="sm" onClick={selectBoardsFromUrls} disabled={!boardUrlInput.trim()}>
+                      Select from URLs
+                    </Button>
+                  </div>
+
+                  <Separator className="my-4" />
+
                   <div className="flex items-center justify-between mb-4">
                     <div className="flex gap-2">
                       <Button variant="outline" size="sm" onClick={selectAllBoards}>
@@ -3033,6 +3271,268 @@ export default function Home() {
                       setWorklogsToFix([]);
                     }} className="flex-1">
                       Fix More
+                    </Button>
+                    <Button variant="outline" onClick={resetAll}>
+                      Back to Home
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </>
+        )}
+
+        {/* EDIT WORKLOGS MODE (standalone re-sync) */}
+        {mode === "edit-worklogs" && (
+          <>
+            {editWlStep === "credentials" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Connect to Target Workspace</CardTitle>
+                  <CardDescription>
+                    Enter credentials for the workspace whose worklogs you want to re-sync
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="editwl-domain">Workspace Domain</Label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-zinc-500">https://</span>
+                      <Input
+                        id="editwl-domain"
+                        value={editWlCredentials.domain}
+                        onChange={(e) => setEditWlCredentials({ ...editWlCredentials, domain: e.target.value })}
+                        placeholder="enotion"
+                      />
+                      <span className="text-zinc-500">.atlassian.net</span>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="editwl-email">Email</Label>
+                    <Input
+                      id="editwl-email"
+                      type="email"
+                      value={editWlCredentials.email}
+                      onChange={(e) => setEditWlCredentials({ ...editWlCredentials, email: e.target.value })}
+                      placeholder="your-email@example.com"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="editwl-token">API Token</Label>
+                    <Input
+                      id="editwl-token"
+                      type="password"
+                      value={editWlCredentials.apiToken}
+                      onChange={(e) => setEditWlCredentials({ ...editWlCredentials, apiToken: e.target.value })}
+                      placeholder="Your Jira API token"
+                    />
+                  </div>
+                  <Button
+                    onClick={testEditWlConnection}
+                    disabled={loading || !editWlCredentials.domain || !editWlCredentials.email || !editWlCredentials.apiToken}
+                    className="w-full"
+                  >
+                    {loading ? "Connecting..." : "Connect"}
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
+
+            {editWlStep === "files" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Upload Export JSON</CardTitle>
+                  <CardDescription>
+                    Safe re-sync: source → target issues are matched by <strong>summary (task name) + type category</strong> within each project (no audit log needed). Only worklogs on target authored by the current tool user (<code>{editWlCredentials.email || "tool email"}</code>) AND whose date matches a date present in the source are deleted; worklogs by real employees or on other dates are preserved. Then re-adds the source worklogs. No issues, comments, or sprints are touched.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                  <div>
+                    <Label className="text-sm font-medium">Export JSON (from Export mode)</Label>
+                    <Input
+                      type="file"
+                      accept=".json"
+                      className="mt-1"
+                      onChange={handleEditWlExportUpload}
+                    />
+                    {editWlImportFileName && editWlImportData && (
+                      <p className="text-xs text-green-600 mt-1">
+                        ✓ {editWlImportFileName} — {editWlImportData.boards.reduce((n, b) => n + (b.issues?.length || 0), 0)} issues across {editWlImportData.boards.length} board(s), {editWlSourceProjects.length} project(s)
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={loadEditWlTargetProjects}
+                      disabled={loading || !editWlImportData || editWlSourceProjects.length === 0}
+                      className="flex-1"
+                    >
+                      {loading ? "Loading target projects..." : "Next: Map Projects"}
+                    </Button>
+                    <Button variant="outline" onClick={() => setEditWlStep("credentials")}>
+                      Back
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {editWlStep === "mapping" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Map Source → Target Projects</CardTitle>
+                  <CardDescription>
+                    For each source project in the export, pick the corresponding target project. Issues will be matched by summary + type category within the chosen target project.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  {editWlSourceProjects.length === 0 && (
+                    <p className="text-sm text-zinc-500">No source projects found in the export file.</p>
+                  )}
+                  {editWlSourceProjects.map(sp => (
+                    <div key={sp.key} className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+                      <div className="text-sm">
+                        <div className="font-medium">{sp.key}</div>
+                        <div className="text-xs text-zinc-500">{sp.name}</div>
+                      </div>
+                      <div className="text-zinc-400">→</div>
+                      <select
+                        className="border rounded px-2 py-1 text-sm bg-background"
+                        value={editWlProjectMapping[sp.key] || ""}
+                        onChange={(e) => setEditWlProjectMapping({ ...editWlProjectMapping, [sp.key]: e.target.value })}
+                      >
+                        <option value="">— select target —</option>
+                        {editWlTargetProjects.map(tp => (
+                          <option key={tp.key} value={tp.key}>{tp.key} — {tp.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+
+                  <div className="flex gap-2 pt-2">
+                    <Button
+                      onClick={runEditWorklogs}
+                      disabled={
+                        editWlSourceProjects.length === 0 ||
+                        editWlSourceProjects.some(sp => !editWlProjectMapping[sp.key])
+                      }
+                      className="flex-1"
+                    >
+                      Start Re-sync
+                    </Button>
+                    <Button variant="outline" onClick={() => setEditWlStep("files")}>
+                      Back
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {editWlStep === "running" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Re-syncing Worklogs...</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <p className="text-sm text-zinc-600 dark:text-zinc-400 break-words">{editWlProgress.message}</p>
+                  {editWlProgress.totalIssues > 0 && (
+                    <>
+                      <Progress value={(editWlProgress.issueIndex / editWlProgress.totalIssues) * 100} />
+                      <p className="text-xs text-zinc-500 text-center">
+                        {editWlProgress.issueIndex} / {editWlProgress.totalIssues} issues
+                      </p>
+                    </>
+                  )}
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs font-medium text-zinc-500">Activity log ({editWlLog.length} events)</Label>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => navigator.clipboard?.writeText(editWlLog.join("\n"))}
+                        disabled={editWlLog.length === 0}
+                      >
+                        Copy log
+                      </Button>
+                    </div>
+                    <div className="mt-1 h-64 overflow-auto rounded border bg-zinc-50 dark:bg-zinc-900 p-2 font-mono text-[11px] leading-relaxed">
+                      {editWlLog.length === 0 ? (
+                        <div className="text-zinc-400">Waiting for events…</div>
+                      ) : (
+                        editWlLog.slice().reverse().map((line, idx) => (
+                          <div key={idx} className="whitespace-pre-wrap break-words">{line}</div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {editWlStep === "complete" && editWlResult && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Re-sync Complete</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="grid grid-cols-3 gap-4 text-center">
+                    <div>
+                      <div className="text-2xl font-bold text-green-600">{editWlResult.synced}</div>
+                      <div className="text-sm text-zinc-500">Issues Synced</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-red-600">{editWlResult.failed}</div>
+                      <div className="text-sm text-zinc-500">Failed</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-zinc-600">{editWlResult.total}</div>
+                      <div className="text-sm text-zinc-500">Total Issues</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-blue-600">{editWlResult.worklogsAdded}</div>
+                      <div className="text-sm text-zinc-500">Worklogs Added</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-orange-600">{editWlResult.worklogsDeleted}</div>
+                      <div className="text-sm text-zinc-500">Tool Worklogs Deleted</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-zinc-500">{editWlResult.worklogsSkipped}</div>
+                      <div className="text-sm text-zinc-500">Preserved (employee)</div>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs font-medium text-zinc-500">Activity log ({editWlLog.length} events)</Label>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => navigator.clipboard?.writeText(editWlLog.join("\n"))}
+                        disabled={editWlLog.length === 0}
+                      >
+                        Copy log
+                      </Button>
+                    </div>
+                    <div className="mt-1 h-64 overflow-auto rounded border bg-zinc-50 dark:bg-zinc-900 p-2 font-mono text-[11px] leading-relaxed">
+                      {editWlLog.length === 0 ? (
+                        <div className="text-zinc-400">No events logged.</div>
+                      ) : (
+                        editWlLog.slice().reverse().map((line, idx) => (
+                          <div key={idx} className="whitespace-pre-wrap break-words">{line}</div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={() => {
+                        setEditWlStep("files");
+                        setEditWlResult(null);
+                        setEditWlProgress({ message: "", issueIndex: 0, totalIssues: 0 });
+                      }}
+                    >
+                      Re-sync Another
                     </Button>
                     <Button variant="outline" onClick={resetAll}>
                       Back to Home
