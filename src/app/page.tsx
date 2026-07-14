@@ -50,12 +50,13 @@ interface JiraProject {
   projectTypeKey: string;
 }
 
-type Mode = "select" | "export" | "import" | "attachments" | "fix-worklogs" | "edit-worklogs";
+type Mode = "select" | "export" | "import" | "attachments" | "fix-worklogs" | "edit-worklogs" | "pull-worklogs";
 type ExportStep = "credentials" | "boards" | "exporting" | "complete";
 type ImportStep = "credentials" | "upload" | "project" | "importing" | "complete";
 type AttachmentStep = "credentials" | "scan" | "scanning" | "transfer" | "transferring" | "complete";
 type FixWorklogStep = "credentials" | "config" | "scanning" | "review" | "fixing" | "complete";
 type EditWorklogStep = "credentials" | "files" | "mapping" | "running" | "complete";
+type PullWorklogStep = "credentials" | "project" | "running" | "complete";
 
 export default function Home() {
   const [mode, setMode] = useState<Mode>("select");
@@ -189,7 +190,33 @@ export default function Home() {
   const [editWlProgress, setEditWlProgress] = useState({ message: "", issueIndex: 0, totalIssues: 0 });
   const [editWlLog, setEditWlLog] = useState<string[]>([]);
   const [editWlResult, setEditWlResult] = useState<{ synced: number; failed: number; worklogsAdded: number; worklogsDeleted: number; worklogsSkipped: number; total: number } | null>(null);
-  
+
+  // Pull Worklogs (export all worklogs for a project to CSV)
+  const [pullWlStep, setPullWlStep] = useState<PullWorklogStep>("credentials");
+  const [pullWlCredentials, setPullWlCredentials] = useState({
+    domain: "seastudio",
+    email: "",
+    apiToken: "",
+  });
+  const [pullWlProjectKey, setPullWlProjectKey] = useState("KTS9722");
+  const [pullWlProgress, setPullWlProgress] = useState({
+    message: "",
+    issueIndex: 0,
+    totalIssues: 0,
+    worklogCount: 0,
+    currentIssueKey: "",
+  });
+  const [pullWlLog, setPullWlLog] = useState<string[]>([]);
+  const [pullWlCsv, setPullWlCsv] = useState("");
+  const [pullWlResult, setPullWlResult] = useState<{
+    projectKey: string;
+    totalIssues: number;
+    failedIssues: number;
+    worklogCount: number;
+    totalHours: number;
+    fileName: string;
+  } | null>(null);
+
   // Import progress state
   const [importProgress, setImportProgress] = useState({
     message: "",
@@ -244,6 +271,12 @@ export default function Home() {
         email: savedEmail,
         apiToken: savedImportToken || '',
         domain: savedImportDomain || prev.domain,
+      }));
+      setPullWlCredentials(prev => ({
+        ...prev,
+        email: savedEmail,
+        apiToken: savedExportToken || '',
+        domain: savedExportDomain || prev.domain,
       }));
     }
   }, []);
@@ -911,6 +944,12 @@ export default function Home() {
     setEditWlResult(null);
     setEditWlProgress({ message: "", issueIndex: 0, totalIssues: 0 });
     setEditWlLog([]);
+    setPullWlStep("credentials");
+    setPullWlProjectKey("KTS9722");
+    setPullWlProgress({ message: "", issueIndex: 0, totalIssues: 0, worklogCount: 0, currentIssueKey: "" });
+    setPullWlLog([]);
+    setPullWlCsv("");
+    setPullWlResult(null);
     setError("");
   };
 
@@ -1191,6 +1230,134 @@ export default function Home() {
     }
   };
 
+  const testPullWlConnection = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch("/api/jira/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(pullWlCredentials),
+      });
+      const data = await response.json();
+      if (data.success) {
+        if (rememberCredentials) {
+          setCookie("jira_email", pullWlCredentials.email);
+          setCookie("jira_export_token", pullWlCredentials.apiToken);
+          setCookie("jira_export_domain", pullWlCredentials.domain);
+        }
+        setPullWlStep("project");
+      } else {
+        setError(data.error || "Connection failed");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Connection failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runPullWorklogs = async () => {
+    const key = pullWlProjectKey.trim().toUpperCase();
+    if (!key) {
+      setError("Project key required");
+      return;
+    }
+    setPullWlStep("running");
+    setPullWlResult(null);
+    setPullWlCsv("");
+    setPullWlProgress({ message: "Starting...", issueIndex: 0, totalIssues: 0, worklogCount: 0, currentIssueKey: "" });
+    setPullWlLog([]);
+    setError("");
+
+    try {
+      const response = await fetch("/api/jira/pull-worklogs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...pullWlCredentials,
+          projectKey: key,
+        }),
+      });
+
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        throw new Error((errBody as { error?: string }).error || `HTTP ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response stream");
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalResult: {
+        projectKey: string;
+        totalIssues: number;
+        failedIssues: number;
+        worklogCount: number;
+        totalHours: number;
+        fileName: string;
+      } | null = null;
+      let csv = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.type === "progress" || data.type === "status") {
+              setPullWlProgress(prev => ({
+                message: data.message || prev.message,
+                issueIndex: data.issueIndex ?? prev.issueIndex,
+                totalIssues: data.totalIssues ?? prev.totalIssues,
+                worklogCount: data.worklogCount ?? prev.worklogCount,
+                currentIssueKey: data.currentIssueKey ?? prev.currentIssueKey,
+              }));
+              if (data.message) {
+                const ts = new Date().toLocaleTimeString();
+                setPullWlLog(prev => [...prev.slice(-499), `[${ts}] ${data.message}`]);
+              }
+            } else if (data.type === "complete") {
+              finalResult = data.results;
+              csv = data.csv || "";
+            } else if (data.type === "error") {
+              throw new Error(data.message);
+            }
+          } catch (parseErr) {
+            if (parseErr instanceof Error && parseErr.message && !parseErr.message.includes("JSON")) {
+              throw parseErr;
+            }
+          }
+        }
+      }
+
+      if (!finalResult) throw new Error("Pull completed without results");
+      setPullWlResult(finalResult);
+      setPullWlCsv(csv);
+      setPullWlStep("complete");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Pull worklogs failed");
+      setPullWlStep("project");
+    }
+  };
+
+  const downloadPullWlCsv = () => {
+    if (!pullWlCsv || !pullWlResult) return;
+    const blob = new Blob([pullWlCsv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = pullWlResult.fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   // Reset export but keep credentials
   const resetExport = () => {
     setExportStep("boards");
@@ -1323,6 +1490,26 @@ export default function Home() {
                 <Button variant="outline" className="w-full">Edit Worklogs</Button>
               </CardContent>
             </Card>
+
+            <Card
+              className="cursor-pointer hover:border-teal-500 transition-colors"
+              onClick={() => setMode("pull-worklogs")}
+            >
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <svg className="w-6 h-6 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  Pull Worklogs
+                </CardTitle>
+                <CardDescription>
+                  Fetch all log work for a project key and download as CSV
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <Button variant="outline" className="w-full">Pull Worklogs</Button>
+              </CardContent>
+            </Card>
           </div>
         </div>
       </div>
@@ -1342,6 +1529,7 @@ export default function Home() {
                mode === "import" ? "Import to Jira" :
                mode === "attachments" ? "Transfer Attachments" :
                mode === "edit-worklogs" ? "Edit Worklogs" :
+               mode === "pull-worklogs" ? "Pull Worklogs" :
                "Fix Worklogs"}
             </h1>
             <p className="text-zinc-600 dark:text-zinc-400 mt-2">
@@ -1353,6 +1541,8 @@ export default function Home() {
                 ? "Transfer attachments between workspaces"
                 : mode === "edit-worklogs"
                 ? `Re-sync worklogs in ${editWlCredentials.domain}.atlassian.net`
+                : mode === "pull-worklogs"
+                ? `Pull worklogs from ${pullWlCredentials.domain}.atlassian.net`
                 : `Fix worklogs in ${importCredentials.domain}.atlassian.net`
               }
             </p>
@@ -3283,6 +3473,196 @@ export default function Home() {
         )}
 
         {/* EDIT WORKLOGS MODE (standalone re-sync) */}
+        {mode === "pull-worklogs" && (
+          <>
+            {pullWlStep === "credentials" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Connect to Workspace</CardTitle>
+                  <CardDescription>
+                    Enter credentials for the Jira workspace to pull worklogs from
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="pullwl-domain">Workspace Domain</Label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-zinc-500">https://</span>
+                      <Input
+                        id="pullwl-domain"
+                        value={pullWlCredentials.domain}
+                        onChange={(e) => setPullWlCredentials({ ...pullWlCredentials, domain: e.target.value })}
+                        placeholder="seastudio"
+                      />
+                      <span className="text-zinc-500">.atlassian.net</span>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="pullwl-email">Email</Label>
+                    <Input
+                      id="pullwl-email"
+                      type="email"
+                      value={pullWlCredentials.email}
+                      onChange={(e) => setPullWlCredentials({ ...pullWlCredentials, email: e.target.value })}
+                      placeholder="your-email@example.com"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="pullwl-token">API Token</Label>
+                    <Input
+                      id="pullwl-token"
+                      type="password"
+                      value={pullWlCredentials.apiToken}
+                      onChange={(e) => setPullWlCredentials({ ...pullWlCredentials, apiToken: e.target.value })}
+                      placeholder="Your Jira API token"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="pullwl-remember"
+                      checked={rememberCredentials}
+                      onCheckedChange={(checked) => setRememberCredentials(checked === true)}
+                    />
+                    <Label htmlFor="pullwl-remember" className="text-sm font-normal">Remember credentials</Label>
+                  </div>
+                  <Button
+                    onClick={testPullWlConnection}
+                    disabled={loading || !pullWlCredentials.domain || !pullWlCredentials.email || !pullWlCredentials.apiToken}
+                    className="w-full"
+                  >
+                    {loading ? "Connecting..." : "Connect"}
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
+
+            {pullWlStep === "project" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Project Key</CardTitle>
+                  <CardDescription>
+                    Enter the project key to export all log work (e.g. KTS9722)
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="pullwl-project">Project Key</Label>
+                    <Input
+                      id="pullwl-project"
+                      value={pullWlProjectKey}
+                      onChange={(e) => setPullWlProjectKey(e.target.value.toUpperCase())}
+                      placeholder="KTS9722"
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={runPullWorklogs}
+                      disabled={!pullWlProjectKey.trim()}
+                      className="flex-1"
+                    >
+                      Pull Worklogs
+                    </Button>
+                    <Button variant="outline" onClick={() => setPullWlStep("credentials")}>
+                      Back
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {pullWlStep === "running" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Pulling Worklogs...</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <p className="text-sm text-zinc-600 dark:text-zinc-400 break-words">{pullWlProgress.message}</p>
+                  {pullWlProgress.totalIssues > 0 && (
+                    <>
+                      <Progress value={(pullWlProgress.issueIndex / pullWlProgress.totalIssues) * 100} />
+                      <p className="text-xs text-zinc-500 text-center">
+                        {pullWlProgress.issueIndex} / {pullWlProgress.totalIssues} issues
+                        {pullWlProgress.worklogCount > 0 ? ` · ${pullWlProgress.worklogCount} worklogs` : ""}
+                      </p>
+                    </>
+                  )}
+                  <div>
+                    <Label className="text-xs font-medium text-zinc-500">Activity log ({pullWlLog.length})</Label>
+                    <div className="mt-1 h-64 overflow-auto rounded border bg-zinc-50 dark:bg-zinc-900 p-2 font-mono text-[11px] leading-relaxed">
+                      {pullWlLog.length === 0 ? (
+                        <div className="text-zinc-400">Waiting for events…</div>
+                      ) : (
+                        pullWlLog.slice().reverse().map((line, idx) => (
+                          <div key={idx} className="whitespace-pre-wrap break-words">{line}</div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {pullWlStep === "complete" && pullWlResult && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Pull Complete</CardTitle>
+                  <CardDescription>
+                    Project {pullWlResult.projectKey}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+                    <div>
+                      <div className="text-2xl font-bold text-blue-600">{pullWlResult.worklogCount}</div>
+                      <div className="text-sm text-zinc-500">Worklogs</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-zinc-700 dark:text-zinc-200">{pullWlResult.totalHours}</div>
+                      <div className="text-sm text-zinc-500">Total Hours</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-green-600">{pullWlResult.totalIssues}</div>
+                      <div className="text-sm text-zinc-500">Issues</div>
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-red-600">{pullWlResult.failedIssues}</div>
+                      <div className="text-sm text-zinc-500">Failed Issues</div>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button onClick={downloadPullWlCsv} disabled={!pullWlCsv} className="flex-1">
+                      Download CSV
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        setPullWlStep("project");
+                        setPullWlResult(null);
+                        setPullWlCsv("");
+                        setPullWlProgress({ message: "", issueIndex: 0, totalIssues: 0, worklogCount: 0, currentIssueKey: "" });
+                        setPullWlLog([]);
+                      }}
+                    >
+                      Pull Another
+                    </Button>
+                    <Button variant="outline" onClick={resetAll}>
+                      Home
+                    </Button>
+                  </div>
+                  <div>
+                    <Label className="text-xs font-medium text-zinc-500">Activity log ({pullWlLog.length})</Label>
+                    <div className="mt-1 h-48 overflow-auto rounded border bg-zinc-50 dark:bg-zinc-900 p-2 font-mono text-[11px] leading-relaxed">
+                      {pullWlLog.slice().reverse().map((line, idx) => (
+                        <div key={idx} className="whitespace-pre-wrap break-words">{line}</div>
+                      ))}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </>
+        )}
+
         {mode === "edit-worklogs" && (
           <>
             {editWlStep === "credentials" && (
