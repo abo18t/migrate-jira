@@ -5,8 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build && node scripts/pack-dist.mjs",
-    "start": "next start",
-    "lint": "eslint"
+    "start": "node dist/server.js",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.0",

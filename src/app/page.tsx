@@ -50,13 +50,25 @@ interface JiraProject {
   projectTypeKey: string;
 }
 
-type Mode = "select" | "export" | "import" | "attachments" | "fix-worklogs" | "edit-worklogs" | "pull-worklogs";
+type Mode = "select" | "export" | "import" | "attachments" | "fix-worklogs" | "edit-worklogs" | "pull-worklogs" | "studio-worklogs";
 type ExportStep = "credentials" | "boards" | "exporting" | "complete";
 type ImportStep = "credentials" | "upload" | "project" | "importing" | "complete";
 type AttachmentStep = "credentials" | "scan" | "scanning" | "transfer" | "transferring" | "complete";
 type FixWorklogStep = "credentials" | "config" | "scanning" | "review" | "fixing" | "complete";
 type EditWorklogStep = "credentials" | "files" | "mapping" | "running" | "complete";
 type PullWorklogStep = "credentials" | "project" | "running" | "complete";
+type StudioWorklogStep = "config" | "running" | "complete";
+type StudioWorklogResult = {
+  domain: string;
+  resolvedMembers: number;
+  accountIds: number;
+  issues: number;
+  worklogs: number;
+  totalHours: number;
+  failedIssues: number;
+  fileName: string;
+  csv: string;
+};
 
 export default function Home() {
   const [mode, setMode] = useState<Mode>("select");
@@ -216,6 +228,18 @@ export default function Home() {
     totalHours: number;
     fileName: string;
   } | null>(null);
+
+  // Studio Worklogs (all members' log work across SEA + ENO, Jira CSV export format)
+  const [studioWlStep, setStudioWlStep] = useState<StudioWorklogStep>("config");
+  const [studioWlFromDate, setStudioWlFromDate] = useState("");
+  const [studioWlToDate, setStudioWlToDate] = useState("");
+  const [studioWlMembersCsv, setStudioWlMembersCsv] = useState("");
+  const [studioWlMembersFileName, setStudioWlMembersFileName] = useState("");
+  const [studioWlOnlyMembers, setStudioWlOnlyMembers] = useState(true);
+  const [studioWlIncludeWatchers, setStudioWlIncludeWatchers] = useState(true);
+  const [studioWlProgress, setStudioWlProgress] = useState({ message: "", issueIndex: 0, totalIssues: 0, worklogCount: 0 });
+  const [studioWlLog, setStudioWlLog] = useState<string[]>([]);
+  const [studioWlResults, setStudioWlResults] = useState<StudioWorklogResult[]>([]);
 
   // Import progress state
   const [importProgress, setImportProgress] = useState({
@@ -950,6 +974,10 @@ export default function Home() {
     setPullWlLog([]);
     setPullWlCsv("");
     setPullWlResult(null);
+    setStudioWlStep("config");
+    setStudioWlProgress({ message: "", issueIndex: 0, totalIssues: 0, worklogCount: 0 });
+    setStudioWlLog([]);
+    setStudioWlResults([]);
     setError("");
   };
 
@@ -1228,6 +1256,102 @@ export default function Home() {
       setError(err instanceof Error ? err.message : "Edit worklogs failed");
       setEditWlStep("mapping");
     }
+  };
+
+  const runStudioWorklogs = async () => {
+    setStudioWlStep("running");
+    setStudioWlResults([]);
+    setStudioWlProgress({ message: "Starting...", issueIndex: 0, totalIssues: 0, worklogCount: 0 });
+    setStudioWlLog([]);
+    setError("");
+
+    if (rememberCredentials) {
+      saveCredentials("export");
+      saveCredentials("import");
+    }
+
+    try {
+      const response = await fetch("/api/jira/studio-worklogs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          seaCredentials: exportCredentials,
+          enoCredentials: importCredentials,
+          membersCsv: studioWlMembersCsv || undefined,
+          fromDate: studioWlFromDate || undefined,
+          toDate: studioWlToDate || undefined,
+          onlyMemberWorklogs: studioWlOnlyMembers,
+          includeWatchers: studioWlIncludeWatchers,
+          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        }),
+      });
+
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        throw new Error((errBody as { error?: string }).error || `HTTP ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response stream");
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalResults: StudioWorklogResult[] | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          let data;
+          try {
+            data = JSON.parse(line.slice(6));
+          } catch {
+            continue;
+          }
+          if (data.type === "progress" || data.type === "status" || data.type === "warning") {
+            if (data.type !== "warning") {
+              setStudioWlProgress(prev => ({
+                message: data.message || prev.message,
+                issueIndex: data.issueIndex ?? (data.type === "status" ? prev.issueIndex : 0),
+                totalIssues: data.totalIssues ?? prev.totalIssues,
+                worklogCount: data.worklogCount ?? prev.worklogCount,
+              }));
+            }
+            if (data.message) {
+              const ts = new Date().toLocaleTimeString();
+              const prefix = data.type === "warning" ? "⚠ " : "";
+              setStudioWlLog(prev => [...prev.slice(-999), `[${ts}] ${prefix}${data.message}`]);
+            }
+          } else if (data.type === "complete") {
+            finalResults = data.results;
+          } else if (data.type === "error") {
+            throw new Error(data.message);
+          }
+        }
+      }
+
+      if (!finalResults) throw new Error("Finished without results");
+      setStudioWlResults(finalResults);
+      setStudioWlStep("complete");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Studio worklogs failed");
+      setStudioWlStep("config");
+    }
+  };
+
+  const downloadStudioWlCsv = (result: StudioWorklogResult) => {
+    const blob = new Blob([result.csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = result.fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   };
 
   const testPullWlConnection = async () => {
@@ -1510,6 +1634,26 @@ export default function Home() {
                 <Button variant="outline" className="w-full">Pull Worklogs</Button>
               </CardContent>
             </Card>
+
+            <Card
+              className="cursor-pointer hover:border-indigo-500 transition-colors"
+              onClick={() => setMode("studio-worklogs")}
+            >
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <svg className="w-6 h-6 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                  Studio Worklogs
+                </CardTitle>
+                <CardDescription>
+                  Log work of all studio members (member.csv) across seastudio + enotion, in Jira CSV export format
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <Button variant="outline" className="w-full">Studio Worklogs</Button>
+              </CardContent>
+            </Card>
           </div>
         </div>
       </div>
@@ -1530,6 +1674,7 @@ export default function Home() {
                mode === "attachments" ? "Transfer Attachments" :
                mode === "edit-worklogs" ? "Edit Worklogs" :
                mode === "pull-worklogs" ? "Pull Worklogs" :
+               mode === "studio-worklogs" ? "Studio Worklogs" :
                "Fix Worklogs"}
             </h1>
             <p className="text-zinc-600 dark:text-zinc-400 mt-2">
@@ -1543,6 +1688,8 @@ export default function Home() {
                 ? `Re-sync worklogs in ${editWlCredentials.domain}.atlassian.net`
                 : mode === "pull-worklogs"
                 ? `Pull worklogs from ${pullWlCredentials.domain}.atlassian.net`
+                : mode === "studio-worklogs"
+                ? `${exportCredentials.domain} + ${importCredentials.domain}`
                 : `Fix worklogs in ${importCredentials.domain}.atlassian.net`
               }
             </p>
@@ -3655,6 +3802,209 @@ export default function Home() {
                       {pullWlLog.slice().reverse().map((line, idx) => (
                         <div key={idx} className="whitespace-pre-wrap break-words">{line}</div>
                       ))}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </>
+        )}
+
+        {mode === "studio-worklogs" && (
+          <>
+            {studioWlStep === "config" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Studio Worklogs Report</CardTitle>
+                  <CardDescription>
+                    Each member is looked up in both organizations by SEA email, ENO email and staff ID, so work logged
+                    with an enotion account in seastudio is included. Output is one CSV per organization with the same
+                    columns as Jira&apos;s &quot;Export CSV (all fields)&quot;.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                  {([
+                    { label: "SEA organization", id: "studiowl-sea", creds: exportCredentials, setCreds: setExportCredentials },
+                    { label: "ENO organization", id: "studiowl-eno", creds: importCredentials, setCreds: setImportCredentials },
+                  ] as const).map(({ label, id, creds, setCreds }) => (
+                    <div key={id} className="space-y-2 rounded border p-3">
+                      <Label className="font-medium">{label}</Label>
+                      <div className="flex items-center gap-2">
+                        <span className="text-zinc-500">https://</span>
+                        <Input
+                          id={`${id}-domain`}
+                          value={creds.domain}
+                          onChange={(e) => setCreds({ ...creds, domain: e.target.value })}
+                        />
+                        <span className="text-zinc-500">.atlassian.net</span>
+                      </div>
+                      <Input
+                        id={`${id}-email`}
+                        type="email"
+                        value={creds.email}
+                        onChange={(e) => setCreds({ ...creds, email: e.target.value })}
+                        placeholder="Email"
+                      />
+                      <Input
+                        id={`${id}-token`}
+                        type="password"
+                        value={creds.apiToken}
+                        onChange={(e) => setCreds({ ...creds, apiToken: e.target.value })}
+                        placeholder="API token (leave empty to skip this organization)"
+                      />
+                    </div>
+                  ))}
+
+                  <div className="space-y-2">
+                    <Label htmlFor="studiowl-members">Member list (PU,ID,Email SEA,Email ENO)</Label>
+                    <Input
+                      id="studiowl-members"
+                      type="file"
+                      accept=".csv,text/csv"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        setStudioWlMembersCsv(await file.text());
+                        setStudioWlMembersFileName(file.name);
+                      }}
+                    />
+                    <p className="text-xs text-zinc-500">
+                      {studioWlMembersFileName
+                        ? `Using ${studioWlMembersFileName}`
+                        : "No file selected — the server's member.csv in the project root is used."}
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="studiowl-from">From (worklog date)</Label>
+                      <Input id="studiowl-from" type="date" value={studioWlFromDate} onChange={(e) => setStudioWlFromDate(e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="studiowl-to">To (inclusive)</Label>
+                      <Input id="studiowl-to" type="date" value={studioWlToDate} onChange={(e) => setStudioWlToDate(e.target.value)} />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="studiowl-only-members"
+                        checked={studioWlOnlyMembers}
+                        onCheckedChange={(checked) => setStudioWlOnlyMembers(checked === true)}
+                      />
+                      <Label htmlFor="studiowl-only-members" className="text-sm font-normal">
+                        Only keep members&apos; worklogs in &quot;Log Work&quot; columns (unchecked = all worklogs of matched issues, like a raw Jira export)
+                      </Label>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="studiowl-watchers"
+                        checked={studioWlIncludeWatchers}
+                        onCheckedChange={(checked) => setStudioWlIncludeWatchers(checked === true)}
+                      />
+                      <Label htmlFor="studiowl-watchers" className="text-sm font-normal">
+                        Include Watchers columns (one extra API call per issue)
+                      </Label>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="studiowl-remember"
+                        checked={rememberCredentials}
+                        onCheckedChange={(checked) => setRememberCredentials(checked === true)}
+                      />
+                      <Label htmlFor="studiowl-remember" className="text-sm font-normal">Remember credentials</Label>
+                    </div>
+                  </div>
+
+                  <Button
+                    onClick={runStudioWorklogs}
+                    disabled={
+                      !(exportCredentials.domain && exportCredentials.email && exportCredentials.apiToken) &&
+                      !(importCredentials.domain && importCredentials.email && importCredentials.apiToken)
+                    }
+                    className="w-full"
+                  >
+                    Get Worklogs
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
+
+            {(studioWlStep === "running" || studioWlStep === "complete") && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>{studioWlStep === "running" ? "Collecting Worklogs..." : "Done"}</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  {studioWlStep === "running" && (
+                    <>
+                      <p className="text-sm text-zinc-600 dark:text-zinc-400 break-words">{studioWlProgress.message}</p>
+                      {studioWlProgress.totalIssues > 0 && (
+                        <>
+                          <Progress value={(studioWlProgress.issueIndex / studioWlProgress.totalIssues) * 100} />
+                          <p className="text-xs text-zinc-500 text-center">
+                            {studioWlProgress.issueIndex} / {studioWlProgress.totalIssues} issues
+                            {studioWlProgress.worklogCount > 0 ? ` · ${studioWlProgress.worklogCount} worklogs` : ""}
+                          </p>
+                        </>
+                      )}
+                    </>
+                  )}
+
+                  {studioWlStep === "complete" && (
+                    <>
+                      {studioWlResults.map((r) => (
+                        <div key={r.domain} className="rounded border p-3 space-y-3">
+                          <div className="font-medium">{r.domain}.atlassian.net</div>
+                          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-center">
+                            <div>
+                              <div className="text-xl font-bold">{r.resolvedMembers}</div>
+                              <div className="text-xs text-zinc-500">Members ({r.accountIds} accounts)</div>
+                            </div>
+                            <div>
+                              <div className="text-xl font-bold text-green-600">{r.issues}</div>
+                              <div className="text-xs text-zinc-500">Issues</div>
+                            </div>
+                            <div>
+                              <div className="text-xl font-bold text-blue-600">{r.worklogs}</div>
+                              <div className="text-xs text-zinc-500">Worklogs</div>
+                            </div>
+                            <div>
+                              <div className="text-xl font-bold">{r.totalHours}</div>
+                              <div className="text-xs text-zinc-500">Hours</div>
+                            </div>
+                            <div>
+                              <div className="text-xl font-bold text-red-600">{r.failedIssues}</div>
+                              <div className="text-xs text-zinc-500">Failed</div>
+                            </div>
+                          </div>
+                          <Button onClick={() => downloadStudioWlCsv(r)} className="w-full">
+                            Download {r.fileName}
+                          </Button>
+                        </div>
+                      ))}
+                      <div className="flex gap-2">
+                        <Button variant="outline" className="flex-1" onClick={() => setStudioWlStep("config")}>
+                          Run Again
+                        </Button>
+                        <Button variant="outline" onClick={resetAll}>
+                          Home
+                        </Button>
+                      </div>
+                    </>
+                  )}
+
+                  <div>
+                    <Label className="text-xs font-medium text-zinc-500">Activity log ({studioWlLog.length})</Label>
+                    <div className="mt-1 h-64 overflow-auto rounded border bg-zinc-50 dark:bg-zinc-900 p-2 font-mono text-[11px] leading-relaxed">
+                      {studioWlLog.length === 0 ? (
+                        <div className="text-zinc-400">Waiting for events…</div>
+                      ) : (
+                        studioWlLog.slice().reverse().map((line, idx) => (
+                          <div key={idx} className="whitespace-pre-wrap break-words">{line}</div>
+                        ))
+                      )}
                     </div>
                   </div>
                 </CardContent>

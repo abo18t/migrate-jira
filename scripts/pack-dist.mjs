@@ -19,4 +19,9 @@ if (fs.existsSync(path.join(root, "public"))) {
   fs.cpSync(path.join(root, "public"), path.join(dist, "public"), { recursive: true });
 }
 
+// Default member list for the Studio Worklogs mode (read from the working directory)
+if (fs.existsSync(path.join(root, "member.csv"))) {
+  fs.copyFileSync(path.join(root, "member.csv"), path.join(dist, "member.csv"));
+}
+
 console.log("✅ dist/ ready — copy to target machine and run: node server.js");

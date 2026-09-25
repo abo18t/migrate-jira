@@ -1,36 +1,77 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Jira Migration Tool
 
-## Getting Started
+Internal tool (Next.js 16) for Eighteen Studio: migrate Jira projects between workspaces (`seastudio` → `enotion`) and report log work.
 
-First, run the development server:
+No `.env` or database — Jira credentials (email + [API token](https://id.atlassian.com/manage-profile/security/api-tokens)) are entered in the UI and stored in browser cookies only.
+
+## Run
+
+Requires Node.js 20+ and pnpm.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm install
+pnpm dev          # development → http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Production:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+pnpm build        # next build + packs a self-contained app into dist/
+pnpm start        # node dist/server.js → http://localhost:3000
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+`dist/` runs on any machine with Node.js, no `pnpm install` needed:
 
-## Learn More
+```bash
+cd dist && PORT=8080 HOSTNAME=0.0.0.0 node server.js
+```
 
-To learn more about Next.js, take a look at the following resources:
+> `next start` does not work here because the app is built with `output: "standalone"`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Scripts
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Script           | What it does                                   |
+| ---------------- | ---------------------------------------------- |
+| `pnpm dev`       | Dev server with hot reload                     |
+| `pnpm build`     | Production build, output in `dist/`            |
+| `pnpm start`     | Run the production build from `dist/`          |
+| `pnpm lint`      | ESLint                                         |
+| `pnpm typecheck` | TypeScript check (`tsc --noEmit`)              |
 
-## Deploy on Vercel
+## Features
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+| Mode                | Purpose                                                                                     |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| **Export**          | Export boards, sprints, issues, worklogs, comments, changelog from the source workspace to JSON |
+| **Import**          | Import the JSON into the target workspace (projects, issue types, sprints, links, statuses, assignees) |
+| **Attachments**     | Copy attachments from source to target issues using the import key mapping                  |
+| **Fix Worklogs**    | Add original author info to worklogs imported without it                                   |
+| **Edit Worklogs**   | Re-sync worklogs only, from an export JSON + audit log                                      |
+| **Pull Worklogs**   | All worklogs of one project → flat CSV                                                      |
+| **Studio Worklogs** | Worklogs of every studio member across **both** organizations → CSV in Jira's own export format |
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### Studio Worklogs
+
+1. Enter credentials for the SEA and ENO organizations (leave a token empty to skip that org).
+2. Upload a member list, or leave empty to use `member.csv` in the project root (in `dist/` for production):
+
+   ```csv
+   PU,ID,Email SEA,Email ENO
+   PU1,487,khang.phan@seastudio.com,khang.0487@enotion.io
+   ```
+
+3. Optionally pick a worklog date range, then **Get Worklogs**.
+
+Each member is looked up in **each** organization by SEA email, ENO email and staff ID (display name `{ID}-name-role`), because a member may log work in seastudio with an enotion account. The result is one CSV per organization, with the same columns as Jira's *Export → CSV (all fields)*: one row per issue, repeated `Log Work` columns formatted `comment;dd/MMM/yy h:mm AM;accountId;seconds`.
+
+## Project structure
+
+```
+src/app/page.tsx              UI (all modes)
+src/app/setup/page.tsx        Project setup checklist generator
+src/app/api/jira/*/route.ts   API routes (SSE streaming for long jobs)
+src/lib/jira.ts               Jira REST v3 + Agile API client
+src/lib/jira-csv-export.ts    Jira-format CSV builder
+src/lib/staff-mapping.ts      Staff ID → enotion email mapping
+scripts/pack-dist.mjs         Packs the standalone build into dist/
+```
